@@ -1,0 +1,37 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python caching & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Packaging build files
+build/
+dist/
+*.spec
+
+# Logs and outputs
+logs/
+*.log
+output_test.xlsx
+excel/output_*
+*.xlsx
+!electoral_roll_template.xlsx
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Large PDF files (scanned electoral rolls)
+*.pdf
+
+# IDE/Tool configs
+.vscode/
+.idea/
+.gemini/
+.antigravityignore
