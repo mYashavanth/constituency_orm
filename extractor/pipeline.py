@@ -4,11 +4,11 @@ import concurrent.futures
 from typing import List, Dict, Any, Callable, Optional
 from extractor.logger import logger
 from extractor.metadata_parser import parse_page1_metadata
-from extractor.ocr_fallback import extract_ocr_page, get_ocr_model, pil_to_cv2, convert_pdf_page_to_image, extract_sorted_lines_from_ocr_res
+from extractor.ocr_fallback import extract_ocr_page, get_ocr_model, pil_to_cv2, convert_pdf_page_to_image, extract_sorted_lines_from_ocr_res, run_ocr_on_image
 from extractor.pdf_text_parser import extract_pdf_text_page
 from extractor.validators import validate_voter_record, is_record_creatable
 
-def _process_page_worker(pdf_path: str, p_idx: int, page_num: int, metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _process_page_worker(pdf_path: str, p_idx: int, page_num: int, metadata: Dict[str, Any], force_ocr: bool = False) -> Dict[str, Any]:
     """
     Worker function to process a single page in a separate thread.
     Opens its own PyMuPDF document instance for thread safety.
@@ -20,12 +20,18 @@ def _process_page_worker(pdf_path: str, p_idx: int, page_num: int, metadata: Dic
         doc = fitz.open(pdf_path)
         page = doc[p_idx]
         
-        # Try text-first extraction
-        page_records, is_voter, updated_sec_no, updated_sec_name, _ = extract_pdf_text_page(
-            page, page_num, metadata, "", "", 1
-        )
+        page_records = None
+        is_voter = False
+        updated_sec_no = ""
+        updated_sec_name = ""
         
-        # If pdf_text_parser returns None, it means the page is scanned and needs OCR
+        if not force_ocr:
+            # Try text-first extraction
+            page_records, is_voter, updated_sec_no, updated_sec_name, _ = extract_pdf_text_page(
+                page, page_num, metadata, "", "", 1
+            )
+        
+        # If force_ocr or text-first extraction returned None (scanned page)
         if page_records is None:
             ocr_start = time.time()
             page_records, is_voter, updated_sec_no, updated_sec_name, _ = extract_ocr_page(
@@ -109,11 +115,8 @@ def run_extraction_pipeline(
             })
         try:
             page1_pil = convert_pdf_page_to_image(pdf_path, 0, dpi=100)
-            page1_cv = pil_to_cv2(page1_pil)
-            ocr = get_ocr_model()
-            res = ocr.ocr(page1_cv)
-            if res and len(res) > 0:
-                text_lines = extract_sorted_lines_from_ocr_res(res[0])
+            res = run_ocr_on_image(page1_pil)
+            text_lines = extract_sorted_lines_from_ocr_res(res)
         except Exception as e:
             logger.error(f"Failed running OCR on cover page: {e}")
 
@@ -122,8 +125,10 @@ def run_extraction_pipeline(
     doc.close()  # Close main thread's fitz document
     
     # State tracking for sequential reconstruction
-    current_section_no = metadata.get("section_no", "")
-    current_village_area = metadata.get("village_area", "")
+    # section_no and village_area start empty — each voter page header is the authoritative source.
+    # booth (main town/village) is permanently from the cover page metadata.
+    current_section_no = ""  # Will be set from page 3's header onwards
+    current_village_area = ""
     expected_sl_no = 1
     all_records = []
     
@@ -149,12 +154,17 @@ def run_extraction_pipeline(
     logger.info("Starting concurrent page processing (max_workers=2)...")
     results = {}
     
+    # Determine if PDF is scanned based on cover page text lines
+    force_ocr = (not text_lines or sum(len(line) for line in text_lines) < 100)
+    if force_ocr:
+        logger.info("Cover page analysis indicates scanned PDF. Bypassing digital text check for all pages.")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = {}
         for p_idx in range(2, total_pages):
             page_num = p_idx + 1
             future = executor.submit(
-                _process_page_worker, pdf_path, p_idx, page_num, metadata
+                _process_page_worker, pdf_path, p_idx, page_num, metadata, force_ocr
             )
             futures[future] = page_num
             
@@ -168,7 +178,8 @@ def run_extraction_pipeline(
             })
             
         next_page_to_process = 3
-        
+        cancelled = False
+
         # As threads finish, store results and perform sequential post-processing
         for future in concurrent.futures.as_completed(futures):
             page_num = futures[future]
@@ -196,13 +207,26 @@ def run_extraction_pipeline(
                     }):
                         logger.info("Extraction aborted by user. Shutting down pool...")
                         executor.shutdown(wait=False, cancel_futures=True)
+                        cancelled = True
                         break
             except Exception as e:
                 logger.error(f"Error retrieving future for page {page_num}: {e}", exc_info=True)
                 results[page_num] = {"success": False, "error": str(e)}
-                
+
+            if cancelled:
+                break
+
             # Process ready page results sequentially to maintain section and serial tracking
-            while next_page_to_process in results:
+            while not cancelled and next_page_to_process in results:
+                # Notify UI which page we're sequentially processing
+                if progress_callback:
+                    progress_callback({
+                        "status": "processing_page",
+                        "page": next_page_to_process,
+                        "total_pages": total_pages,
+                        "message": f"Processing Page {next_page_to_process} of {total_pages}..."
+                    })
+
                 page_res = results[next_page_to_process]
                 if page_res.get("success"):
                     if page_res.get("is_voter"):
@@ -218,10 +242,35 @@ def run_extraction_pipeline(
                         for rec in raw_recs:
                             rec["section_no"] = current_section_no
                             rec["village_area"] = current_village_area
-                            
+
+                            # --- SERIAL RECONSTRUCTION ---
+                            # Enforce strict sequential continuity.
+                            # If the OCR serial number is missing, "0", or deviates from the expected
+                            # sequence (e.g. due to OCR typos like '77' -> '7'), correct it.
+                            sl_val = rec.get("sl_no", "")
+                            try:
+                                sl_val_int = int(str(sl_val).strip())
+                            except ValueError:
+                                sl_val_int = 0
+
+                            if sl_val_int == 0 or sl_val_int != expected_sl_no:
+                                if sl_val_int != 0:
+                                    logger.warning(
+                                        f"  [SL-CORRECT] Page {next_page_to_process}: "
+                                        f"sl_no was '{sl_val}', corrected to {expected_sl_no} to maintain sequence."
+                                    )
+                                rec["sl_no"] = str(expected_sl_no)
                             # Validate and check serial sequence with correct expected_sl_no
                             warnings, sanitized_record = validate_voter_record(rec, expected_sl_no)
                             
+                            # Log validation warnings so they appear in stdout and GUI warning tab
+                            if warnings:
+                                for warn in warnings:
+                                    logger.warning(
+                                        f"Page {next_page_to_process} | SL: {sanitized_record.get('sl_no')} | "
+                                        f"EPIC: {sanitized_record.get('epic_no')} | {warn}"
+                                    )
+                                    
                             if is_record_creatable(sanitized_record):
                                 if isinstance(sanitized_record.get("sl_no"), int):
                                     expected_sl_no = sanitized_record["sl_no"] + 1
@@ -231,6 +280,12 @@ def run_extraction_pipeline(
                                 sanitized_record["warnings"] = warnings
                                 all_records.append(sanitized_record)
                                 page_added_count += 1
+                                logger.info(
+                                    f"  [RECORD] Page {next_page_to_process} | SL: {sanitized_record.get('sl_no')} | "
+                                    f"EPIC: {sanitized_record.get('epic_no')} | Name: {sanitized_record.get('name')} | "
+                                    f"Rel: {sanitized_record.get('relation_type')} - {sanitized_record.get('relation_name')} | "
+                                    f"Age: {sanitized_record.get('age')} | Gender: {sanitized_record.get('gender')}"
+                                )
                         
                         t_time = page_res.get("total_time", 0.0)
                         o_time = page_res.get("ocr_time", 0.0)

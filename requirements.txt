@@ -3,6 +3,10 @@ pyinstaller==6.8.0
 pymupdf==1.24.5
 paddleocr==2.8.1
 paddlepaddle==2.6.2
-opencv-python-headless==4.9.0.80
+opencv-python==4.9.0.80
+opencv-contrib-python==4.9.0.80
 openpyxl==3.1.2
 numpy>=1.24.0,<2.0
+pyobjc-framework-Vision==12.2; sys_platform == 'darwin'
+pyobjc-framework-Quartz==12.2; sys_platform == 'darwin'
+

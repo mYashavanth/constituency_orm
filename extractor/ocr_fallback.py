@@ -2,15 +2,41 @@ import fitz  # PyMuPDF
 import cv2
 import io
 import re
+import platform
+import time
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from typing import List, Dict, Tuple, Any, Optional
-# PaddleOCR is imported lazily inside get_ocr_model() to avoid
-# conflicting with Tkinter's C extension on macOS at startup.
 from extractor.logger import logger
 from extractor.voter_parser import parse_card_text
 from extractor.validators import validate_voter_record, is_record_creatable
 from extractor.section_parser import parse_page_header_section
+
+# Conditional imports for macOS native OCR
+if platform.system() == "Darwin":
+    try:
+        from Foundation import NSURL
+        import Quartz
+        import Vision
+        HAS_MAC_OCR = True
+        
+        # Pre-resolve lazy loaded constants to prevent multi-threading race conditions in PyObjC
+        _ = NSURL.fileURLWithPath_
+        _ = Quartz.CGImageSourceCreateWithURL
+        _ = Quartz.CGImageSourceCreateImageAtIndex
+        _ = Quartz.CGImageGetWidth
+        _ = Quartz.CGImageGetHeight
+        _ = Vision.VNImageRequestHandler
+        _ = Vision.VNRecognizeTextRequest
+    except ImportError:
+        HAS_MAC_OCR = False
+        logger.warning("macOS detected but pyobjc-framework-Vision or Quartz is not installed.")
+else:
+    HAS_MAC_OCR = False
+
+# Default DPI resolution for OCR rendering (increased to 150 DPI for higher accuracy and speed)
+_OCR_DPI = 150
 
 # Singleton OCR model
 _ocr_model = None
@@ -19,14 +45,20 @@ def get_ocr_model():
     """
     Returns the singleton PaddleOCR instance. Lazily imported to avoid
     blocking Tkinter startup on macOS.
+    On macOS, we bypass PaddleOCR completely and use Apple Vision OCR.
     """
     global _ocr_model
+    if platform.system() == "Darwin":
+        logger.info("macOS detected: bypassing PaddleOCR initialization (using native Vision OCR).")
+        return None
+        
     if _ocr_model is None:
         from paddleocr import PaddleOCR  # lazy import
         logger.info("Initializing PaddleOCR model...")
         _ocr_model = PaddleOCR(use_textline_orientation=False, lang="en", cpu_threads=1, show_log=False)
         logger.info("PaddleOCR model loaded successfully (cpu_threads=1).")
     return _ocr_model
+
 
 def ensure_3_channels(img: np.ndarray) -> np.ndarray:
     """
@@ -48,11 +80,10 @@ def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
         return cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
     return open_cv_image
 
-def convert_pdf_page_to_image(pdf_path: str, page_idx: int, dpi: int = 150) -> Image.Image:
+def convert_pdf_page_to_image(pdf_path: str, page_idx: int, dpi: int = 100) -> Image.Image:
     """
     Converts a single PDF page (0-indexed) to a PIL Image.
-    Default DPI is 150 — a good balance between OCR accuracy and speed.
-    (At 100 DPI card characters are ~5-7px tall; at 150 DPI they're ~10-12px — much cleaner.)
+    Default DPI is 100 to perfectly align with coordinates expected by layout engine.
     """
     try:
         with fitz.open(pdf_path) as doc:
@@ -101,6 +132,132 @@ def extract_quadrant_crop(card_img: np.ndarray, quad: str) -> np.ndarray:
         return card_img[0:int(h*0.32), int(w*0.40):w]
     return card_img
 
+def run_mac_vision_ocr(image_pil: Image.Image) -> Dict[str, Any]:
+    """
+    Runs macOS native Vision OCR on a PIL Image.
+    Returns a dictionary structured as:
+    {
+        'rec_texts': [list of text strings],
+        'dt_polys': [list of 4-point coordinate polygons [[x0,y0], [x1,y1], [x2,y2], [x3,y3]]]
+    }
+    """
+    import tempfile
+    import os
+    
+    if not HAS_MAC_OCR:
+        raise RuntimeError("macOS Vision OCR is not available (pyobjc missing or not on macOS).")
+        
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+    try:
+        os.close(temp_fd)
+        image_pil.save(temp_path)
+        
+        url = NSURL.fileURLWithPath_(temp_path)
+        image_source = Quartz.CGImageSourceCreateWithURL(url, None)
+        if not image_source:
+            raise ValueError(f"Failed to create Quartz CGImageSource from {temp_path}")
+            
+        cg_image = Quartz.CGImageSourceCreateImageAtIndex(image_source, 0, None)
+        if not cg_image:
+            raise ValueError(f"Failed to create Quartz CGImage from {temp_path}")
+            
+        w = Quartz.CGImageGetWidth(cg_image)
+        h = Quartz.CGImageGetHeight(cg_image)
+        
+        handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(0) # Accurate (0)
+        request.setUsesLanguageCorrection_(True)
+        
+        success, error = handler.performRequests_error_([request], None)
+        if not success:
+            raise ValueError(f"macOS Vision OCR request failed: {error}")
+            
+        results = request.results()
+        
+        rec_texts = []
+        dt_polys = []
+        
+        for observation in results:
+            candidates = observation.topCandidates_(1)
+            if candidates:
+                text = candidates[0].string()
+                box = observation.boundingBox() # normalized coords (0.0 to 1.0)
+                
+                # Convert normalized bottom-left CGRect to top-left pixel coordinates
+                x0 = box.origin.x * w
+                y0 = (1.0 - box.origin.y - box.size.height) * h
+                x1 = x0 + box.size.width * w
+                y1 = y0
+                x2 = x1
+                y2 = y0 + box.size.height * h
+                x3 = x0
+                y3 = y2
+                
+                poly = [[x0, y0], [x1, y1], [x2, y2], [x3, y3]]
+                
+                rec_texts.append(text)
+                dt_polys.append(poly)
+                
+        return {
+            'rec_texts': rec_texts,
+            'dt_polys': dt_polys,
+            'rec_boxes': dt_polys
+        }
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+
+def _normalize_ocr_result(ocr_res: Any) -> Dict[str, Any]:
+    """
+    Normalizes PaddleOCR or macOS Vision OCR results to a common format:
+    {
+        'rec_texts': List[str],
+        'dt_polys': List[List[List[float]]],
+        'rec_boxes': List[List[List[float]]]
+    }
+    """
+    if isinstance(ocr_res, dict):
+        if 'rec_boxes' not in ocr_res and 'dt_polys' in ocr_res:
+            ocr_res['rec_boxes'] = ocr_res['dt_polys']
+        return ocr_res
+        
+    # Standard PaddleOCR list: [ [box, (text, conf)], ... ]
+    rec_texts = []
+    dt_polys = []
+    if isinstance(ocr_res, list):
+        for item in ocr_res:
+            if isinstance(item, list) and len(item) == 2:
+                box, text_info = item
+                if isinstance(text_info, tuple) and len(text_info) == 2:
+                    text, conf = text_info
+                    rec_texts.append(text)
+                    dt_polys.append(box)
+                    
+    return {
+        'rec_texts': rec_texts,
+        'dt_polys': dt_polys,
+        'rec_boxes': dt_polys
+    }
+
+def run_ocr_on_image(image_pil: Image.Image) -> Dict[str, Any]:
+    """
+    Runs platform-specific OCR on a PIL Image.
+    Returns normalized OCR dict with keys: rec_texts, dt_polys, rec_boxes.
+    """
+    if platform.system() == "Darwin":
+        return run_mac_vision_ocr(image_pil)
+    else:
+        cv_img = pil_to_cv2(image_pil)
+        cv_img_3ch = ensure_3_channels(cv_img)
+        ocr = get_ocr_model()
+        result = ocr.ocr(cv_img_3ch)
+        if not result or len(result) == 0:
+            return {'rec_texts': [], 'dt_polys': [], 'rec_boxes': []}
+        return _normalize_ocr_result(result[0])
+
 def extract_sorted_lines_from_ocr_res(ocr_res: Any) -> List[str]:
     """
     Extracts text lines from an OCRResult object, sorted from top to bottom.
@@ -108,11 +265,12 @@ def extract_sorted_lines_from_ocr_res(ocr_res: Any) -> List[str]:
     if not ocr_res:
         return []
         
-    texts = ocr_res.get('rec_texts', [])
+    normalized = _normalize_ocr_result(ocr_res)
+    texts = normalized.get('rec_texts', [])
     if not texts:
         return []
         
-    boxes = ocr_res.get('rec_boxes', [None] * len(texts))
+    boxes = normalized.get('rec_boxes', [None] * len(texts))
     paired = []
     for i, text in enumerate(texts):
         box = boxes[i] if i < len(boxes) else None
@@ -133,16 +291,18 @@ def extract_sorted_lines_from_ocr_res(ocr_res: Any) -> List[str]:
 
 def run_quadrant_fallback_ocr(card_img: np.ndarray, quad: str) -> List[str]:
     """
-    Runs PaddleOCR on a specific crop quadrant of the card.
+    Runs PaddleOCR or macOS Vision OCR on a specific crop quadrant of the card.
     """
     crop = extract_quadrant_crop(card_img, quad)
-    ocr = get_ocr_model()
-    # Ensure 3 channels
     crop_bgr = ensure_3_channels(crop)
-    res = ocr.ocr(crop_bgr)
-    if res and len(res) > 0:
-        return extract_sorted_lines_from_ocr_res(res[0])
-    return []
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(crop_rgb)
+    try:
+        res_dict = run_ocr_on_image(pil_img)
+        return extract_sorted_lines_from_ocr_res(res_dict)
+    except Exception as e:
+        logger.error(f"OCR quadrant fallback error: {e}")
+        return []
 
 def extract_ocr_page(
     pdf_path: str, 
@@ -153,27 +313,26 @@ def extract_ocr_page(
     expected_sl_no: int
 ) -> Tuple[List[Dict[str, Any]], bool, str, str, int]:
     """
-    Extracts voter records using PaddleOCR layout clustering.
+    Extracts voter records using PaddleOCR or macOS Vision OCR layout clustering.
     
     Returns: (records, is_voter_page, updated_section_no, updated_village_area, next_expected_sl_no)
     """
     page_num = page_idx + 1
     
     # 1. Convert page to image
-    page_pil = convert_pdf_page_to_image(pdf_path, page_idx)
+    page_pil = convert_pdf_page_to_image(pdf_path, page_idx, dpi=_OCR_DPI)
     page_cv = pil_to_cv2(page_pil)
     
     h, w = page_cv.shape[:2]
+    dpi_scale = _OCR_DPI / 100.0
     
-    # 2. Run PaddleOCR on the page
-    ocr = get_ocr_model()
-    result = ocr.ocr(page_cv)
-    
-    if not result or len(result) == 0:
-        logger.warning(f"Page {page_num}: No OCR results found.")
+    # 2. Run OCR on the page
+    try:
+        ocr_res = run_ocr_on_image(page_pil)
+    except Exception as e:
+        logger.error(f"Page {page_num}: OCR failed: {e}")
         return [], False, current_section_no, current_village_area, expected_sl_no
         
-    ocr_res = result[0]
     rec_texts = ocr_res.get('rec_texts', [])
     dt_polys = ocr_res.get('dt_polys', [])
     
@@ -181,9 +340,9 @@ def extract_ocr_page(
         logger.warning(f"Page {page_num}: OCR recognized no text lines.")
         return [], False, current_section_no, current_village_area, expected_sl_no
         
-    # 3. Detect Page Header Section Update (top 8%)
+    # 3. Detect Page Header Section Update (top 10%)
     header_lines = []
-    header_height_threshold = h * 0.08
+    header_height_threshold = h * 0.10
     for i in range(len(rec_texts)):
         box = dt_polys[i]
         cy = sum(pt[1] for pt in box) / 4.0
@@ -198,11 +357,25 @@ def extract_ocr_page(
         
     # 4. Group Y-coordinates of voter "Name" fields to dynamically locate rows
     name_ys = []
+    name_exclude_keywords = [
+        "father", "fath", "fater", "tather", "ather",
+        "husband", "husb", "husoand", "nusoand", "hushand", "husban", "usband", "isband", "tusband",
+        "mother", "moth", "moter", "nother",
+        "wife", "wfe", "wiife",
+        "other", "othr", "relation",
+        "assembly", "constituency", "part", "section"
+    ]
     for i in range(len(rec_texts)):
         text = rec_texts[i].lower()
         box = dt_polys[i]
         cy = sum(pt[1] for pt in box) / 4.0
-        if "name" in text and not any(k in text for k in ["father", "husband", "mother", "wife", "relation"]):
+        
+        has_name_prefix = any(n in text for n in ["name", "nane", "nmae", "neme", "nama", "vame", "wame", "mane"])
+        is_relation = (
+            any(k in text for k in name_exclude_keywords) or 
+            re.search(r'\b(?:gurus?|guardian|gurdian)\b', text)
+        )
+        if has_name_prefix and not is_relation:
             name_ys.append(cy)
             
     name_ys = sorted(name_ys)
@@ -211,7 +384,7 @@ def extract_ocr_page(
     for y in name_ys:
         added = False
         for cluster in row_clusters:
-            if abs(np.mean(cluster) - y) < 20: # 20px threshold for 100 DPI
+            if abs(np.mean(cluster) - y) < (20.0 * dpi_scale):
                 cluster.append(y)
                 added = True
                 break
@@ -224,12 +397,14 @@ def extract_ocr_page(
     steps = []
     for i in range(len(row_ys) - 1):
         steps.append(row_ys[i+1] - row_ys[i])
-    median_step = np.median(steps) if steps else 116.5
-    if not (110.0 <= median_step <= 125.0):
-        median_step = 116.5
+    
+    expected_median_step = 116.5 * dpi_scale
+    median_step = np.median(steps) if steps else expected_median_step
+    if not ((100.0 * dpi_scale) <= median_step <= (130.0 * dpi_scale)):
+        median_step = expected_median_step
         
     if not row_ys:
-        first_y = 140.0 if header_lines else 32.0
+        first_y = (140.0 * dpi_scale) if header_lines else (32.0 * dpi_scale)
         row_ys = [first_y + i * median_step for i in range(10)]
     else:
         first_detected_y = row_ys[0]
@@ -257,9 +432,9 @@ def extract_ocr_page(
                 elif right_neighbor:
                     grid[r] = right_neighbor[1] - (right_neighbor[0] - r) * median_step
                 else:
-                    grid[r] = 32.0 + r * median_step
+                    grid[r] = (32.0 * dpi_scale) + r * median_step
         row_ys = grid
-
+ 
     # 5. Partition OCR texts into 10x3 grid
     cards = {}
     for r in range(10):
@@ -267,8 +442,8 @@ def extract_ocr_page(
             cards[(c, r)] = []
             
     col_width = w / 3.0
-    header_threshold = row_ys[0] - 25
-    footer_threshold = row_ys[9] + 95
+    header_threshold = row_ys[0] - (25 * dpi_scale)
+    footer_threshold = row_ys[9] + (82 * dpi_scale)
     
     for i in range(len(rec_texts)):
         box = dt_polys[i]
@@ -293,30 +468,70 @@ def extract_ocr_page(
             if is_valid_card(cell_texts):
                 valid_card_cells.append((c, r))
                 
-    # If the page contains < 3 valid cards, skip it (non-voter/summary page)
-    if len(valid_card_cells) < 3:
+    # If the page contains < 1 valid cards, skip it (non-voter/summary page)
+    if len(valid_card_cells) < 1:
         logger.info(f"Page {page_num}: OCR non-voter page detected ({len(valid_card_cells)} valid cells). Skipping.")
         return [], False, current_section_no, current_village_area, expected_sl_no
-
+ 
     # 6. Parse cards
     page_records = []
+    is_voter = len(valid_card_cells) >= 1
+    if not is_voter:
+        logger.info(f"Page {page_num}: OCR non-voter page detected ({len(valid_card_cells)} valid cells). Skipping.")
+        return [], False, current_section_no, current_village_area, expected_sl_no
+        
     for r in range(10):
         for c in range(3):
-            if (c, r) not in valid_card_cells:
-                continue
-                
-            cell_lines = sorted(cards[(c, r)], key=lambda l: l[1])
-            cell_texts = [line[2] for line in cell_lines]
-            
-            voter_fields = parse_card_text(cell_texts)
-            
             # Crop card image region for quadrant OCR fallback
             x_start = int(c * col_width)
             x_end = int((c + 1) * col_width)
-            y_start = int(row_ys[r] - 25)
-            y_end = int(row_ys[r] + 95)
+            y_start = int(row_ys[r] - (25 * dpi_scale))
+            y_end = int(row_ys[r] + (82 * dpi_scale))
             
             card_img = page_cv[max(0, y_start):min(h, y_end), max(0, x_start):min(w, x_end)]
+            
+            cell_texts = []
+            if (c, r) in valid_card_cells:
+                cell_lines = sorted(cards[(c, r)], key=lambda l: l[1])
+                cell_texts = [line[2] for line in cell_lines]
+                
+            voter_fields = {}
+            use_fallback = True
+            
+            if cell_texts:
+                voter_fields = parse_card_text(cell_texts)
+                sl_no = voter_fields.get("sl_no", "")
+                epic_no = voter_fields.get("epic_no", "")
+                name = voter_fields.get("name", "")
+                age = voter_fields.get("age", "")
+                
+                # Check age validity
+                age_valid = True
+                if age and str(age).isdigit():
+                    val = int(str(age))
+                    if val < 18 or val > 110:
+                        age_valid = False
+                else:
+                    age_valid = False
+                
+                # Bypasses fallback only if all critical fields are present and valid
+                if sl_no.isdigit() and int(sl_no) > 0 and epic_no and name and age_valid:
+                    use_fallback = False
+                    
+            if use_fallback:
+                try:
+                    crop_bgr = ensure_3_channels(card_img)
+                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(crop_rgb)
+                    res_dict = run_ocr_on_image(pil_img)
+                    fallback_lines = extract_sorted_lines_from_ocr_res(res_dict)
+                    if fallback_lines:
+                        fallback_fields = parse_card_text(fallback_lines)
+                        for k, v in fallback_fields.items():
+                            if v or k not in voter_fields:
+                                voter_fields[k] = v
+                except Exception as ex:
+                    logger.warning(f"Error in full card fallback at ({c},{r}): {ex}")
             
             # Fallback for Serial Number
             sl_no = voter_fields.get("sl_no", "")
@@ -324,7 +539,6 @@ def extract_ocr_page(
                 try:
                     fallback_lines = run_quadrant_fallback_ocr(card_img, "top_left")
                     if fallback_lines:
-                        # Extract serial number from fallback lines
                         from extractor.voter_parser import parse_sl_no as parse_sl
                         fallback_sl = parse_sl(fallback_lines)
                         if fallback_sl.isdigit():
@@ -332,14 +546,19 @@ def extract_ocr_page(
                             logger.info(f"Quadrant serial fallback found: {fallback_sl}")
                 except Exception as ex:
                     logger.warning(f"Error in quadrant serial fallback at ({c},{r}): {ex}")
-                    
+
+            # If serial is still unreadable, mark as "0" sentinel so the pipeline
+            # can reconstruct it sequentially rather than dropping the record.
+            if not voter_fields.get("sl_no", "").isdigit():
+                voter_fields["sl_no"] = "0"
+                logger.debug(f"  Serial unreadable at ({c},{r}), marking as 0 for pipeline reconstruction.")
+
             # Fallback for EPIC Number
             epic_no = voter_fields.get("epic_no", "")
             if not epic_no:
                 try:
                     fallback_lines = run_quadrant_fallback_ocr(card_img, "top_right")
                     if fallback_lines:
-                        # Extract EPIC number from fallback lines
                         from extractor.voter_parser import parse_epic_no as parse_epic
                         fallback_epic = parse_epic(fallback_lines)
                         if fallback_epic:
@@ -364,7 +583,7 @@ def extract_ocr_page(
             
             if is_record_creatable(sanitized_record):
                 # Update expected_sl_no
-                if isinstance(sanitized_record.get("sl_no"), int):
+                if isinstance(sanitized_record.get("sl_no"), int) and sanitized_record["sl_no"] > 0:
                     expected_sl_no = sanitized_record["sl_no"] + 1
                 else:
                     expected_sl_no += 1

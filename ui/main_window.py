@@ -356,24 +356,25 @@ class AppUI(ctk.CTk):
             
     def handle_queue_msg(self, msg: Dict[str, Any]):
         status = msg.get("status")
-        
-        # Log generic messages
-        if "message" in msg:
-            self.write_log(msg["message"])
-            
-        elif status == "warming_up":
+
+        # ------------------------------------------------------------------
+        # Route by status FIRST; only fall back to a plain log write for
+        # statuses that have no dedicated handler.
+        # ------------------------------------------------------------------
+        if status == "warming_up":
+            if "message" in msg:
+                self.write_log(msg["message"])
             self.lbl_status.configure(
                 text="⏳ OCR engine loading — first run takes 1-2 min. Please wait...",
                 text_color="#ffcc00"
             )
-            # Pulse the progress bar to indicate activity
             self._start_indeterminate_progress()
 
         elif status == "started":
             self.progress_bar.set(0)
             self.lbl_percentage.configure(text="0%")
             self.lbl_status.configure(text="Status: Loading cover page...")
-            
+
         elif status == "metadata_loaded":
             meta = msg.get("metadata", {})
             self.lbl_status.configure(text=f"Status: Assembly Roll '{meta.get('ac_name')}' loaded.")
@@ -383,70 +384,90 @@ class AppUI(ctk.CTk):
             self.write_log(f"  Town / Village: {meta.get('booth')}")
             self.write_log(f"  Initial Section: {meta.get('section_no')} - {meta.get('village_area')}")
             self.write_log("----------------------------------\n")
-            
+
         elif status == "processing_page":
             self._stop_indeterminate_progress()
             page = msg.get("page", 0)
             total = msg.get("total_pages", 1)
-            ratio = page / total
+            # page 3 is first processed page; pages 1-2 are cover/format
+            # map [3 .. total] -> [0.0 .. 1.0]
+            effective_pages = max(1, total - 2)
+            ratio = min(1.0, max(0.0, (page - 2) / effective_pages))
             self.progress_bar.set(ratio)
             self.lbl_percentage.configure(text=f"{int(ratio * 100)}%")
             self.lbl_status.configure(
-                text=f"Status: Extracting page {page} of {total}...",
+                text=f"Status: Processing page {page} of {total}...",
                 text_color="#ffffff"
             )
-            
+
         elif status == "page_completed":
             self._stop_indeterminate_progress()
-            self.completed_pages_count += 1
             page = msg.get("page", 0)
             total = msg.get("total_pages", 1)
-            # Display overall progress based on number of completed pages
-            ratio = (self.completed_pages_count + 1) / total # +1 because cover page is already done
-            ratio = min(1.0, max(0.0, ratio))
+            records_on_page = msg.get("records_count", 0)
+            # Track the highest sequential page seen so progress always moves forward
+            self.completed_pages_count = max(self.completed_pages_count, page)
+            effective_pages = max(1, total - 2)
+            ratio = min(1.0, max(0.0, (self.completed_pages_count - 2) / effective_pages))
             self.progress_bar.set(ratio)
             self.lbl_percentage.configure(text=f"{int(ratio * 100)}%")
             self.lbl_status.configure(
-                text=f"Status: Processed page {page} of {total}...",
+                text=f"Status: Page {page}/{total} done — {records_on_page} records extracted.",
                 text_color="#ffffff"
             )
-            
+            if "message" in msg:
+                self.write_log(msg["message"])
+
         elif status == "page_error":
-            # Just logs error
-            pass
-            
+            if "message" in msg:
+                self.write_log(f"[ERROR] {msg['message']}")
+
         elif status == "exporting":
+            self.progress_bar.set(0.99)
+            self.lbl_percentage.configure(text="99%")
             self.lbl_status.configure(text="Status: Generating Excel file...")
-            
+            if "message" in msg:
+                self.write_log(msg["message"])
+
         elif status == "aborted":
+            self._stop_indeterminate_progress()
             self.is_running = False
+            self.cancel_requested = False
             self.btn_start.configure(state="normal", text="Start Extraction", fg_color="#1f538d", hover_color="#14375e")
             self.btn_clear.configure(state="normal")
-            self.lbl_status.configure(text="Status: Stopped / Cancelled.")
             self.progress_bar.set(0)
             self.lbl_percentage.configure(text="0%")
+            self.lbl_status.configure(text="Status: Stopped / Cancelled.", text_color="#ffcc00")
             messagebox.showwarning("Cancelled", "The extraction pipeline was stopped.")
-            
+
         elif status == "completed_success":
+            self._stop_indeterminate_progress()
             self.is_running = False
+            self.cancel_requested = False
             self.btn_start.configure(state="normal", text="Start Extraction", fg_color="#1f538d", hover_color="#14375e")
             self.btn_clear.configure(state="normal")
-            self.lbl_status.configure(text="Status: Extraction complete!")
             self.progress_bar.set(1.0)
             self.lbl_percentage.configure(text="100%")
-            
+            self.lbl_status.configure(text="✅ Extraction complete!", text_color="#4caf50")
+
             out_file = msg.get("output_file", "")
             total_rec = msg.get("total_records", 0)
-            
             self.write_log(f"\n[UI] Extraction success! Saved {total_rec} records to:\n  {out_file}")
             messagebox.showinfo("Success", f"Extraction completed successfully!\nExtracted {total_rec} voters to:\n{out_file}")
-            
+
         elif status == "error":
+            self._stop_indeterminate_progress()
             self.is_running = False
+            self.cancel_requested = False
             self.btn_start.configure(state="normal", text="Start Extraction", fg_color="#1f538d", hover_color="#14375e")
             self.btn_clear.configure(state="normal")
-            self.lbl_status.configure(text="Status: Error encountered.")
+            self.lbl_status.configure(text="Status: Error encountered.", text_color="#f44336")
             messagebox.showerror("Error", f"An error occurred during extraction:\n{msg.get('message')}")
+
+        else:
+            # Generic fallback: just log the message text if any
+            if "message" in msg:
+                self.write_log(msg["message"])
 
 def run_gui():
     import logging
@@ -480,6 +501,8 @@ def run_gui():
             app.write_log(msg["message"])
         elif status == "warn_record":
             app.write_warn(msg["message"])
+            # Also write to main log so everything is visible together
+            app.write_log(f"[WARN] {msg['message']}")
         else:
             original_handle(msg)
 

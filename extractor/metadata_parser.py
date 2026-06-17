@@ -74,41 +74,86 @@ def parse_page1_metadata(text_lines: List[str], pdf_path: str = "") -> Dict[str,
                 
     # 4. Parse Main Town or Village
     # Example: "Main Town or Village : IDALLA KAVALU"
+    booth_val = ""
+    target_idx = -1
     for i, line in enumerate(text_lines):
         line_lower = line.lower()
         if "main town" in line_lower or "town or village" in line_lower or "town/village" in line_lower:
-            if ":" in line:
-                val = line.split(":", 1)[1].strip()
-                if val:
-                    metadata["booth"] = val
-                    logger.info(f"Extracted Town/Village (booth) from same line: {metadata['booth']}")
-                    break
-            if i + 1 < len(text_lines):
-                next_line = text_lines[i+1].strip()
-                if next_line.startswith(":"):
-                    metadata["booth"] = next_line.lstrip(":").strip()
-                else:
-                    metadata["booth"] = next_line
-                logger.info(f"Extracted Town/Village (booth) from next line: {metadata['booth']}")
-                break
+            target_idx = i
+            break
 
-    # 5. Parse Section Information (e.g. "1-Aidalla Kavalu,")
-    for line in text_lines:
-        line_clean = line.strip()
-        # Match pattern: 1-Aidalla Kavalu,
-        match = re.match(r'^(\d+)\s*-\s*([A-Za-z\s,.-]+)$', line_clean)
-        if match:
-            s_no = match.group(1).strip()
-            s_name = match.group(2).strip().rstrip(',')
-            # Exclude lines that match booth name or AC name
-            if not any(k in s_name.lower() for k in ["school", "primary", "govt"]):
-                metadata["section_no"] = s_no
-                metadata["village_area"] = s_name
-                logger.info(f"Extracted Section Details: No={metadata['section_no']}, Area={metadata['village_area']}")
-                break
-                
+    if target_idx != -1:
+        # Check inline first (e.g. "Main Town or Village : SOPPINAHALLI")
+        line = text_lines[target_idx]
+        if ":" in line:
+            parts = line.split(":", 1)
+            val = parts[1].strip()
+            if val:
+                booth_val = val
+
+        if not booth_val:
+            # If not inline, look at nearby lines. OCR vertical text sorting can put the value
+            # on the line before or after the label. We check up to 2 lines away.
+            indices_to_check = [target_idx - 1, target_idx + 1, target_idx - 2, target_idx + 2]
+            
+            # Known labels and structural keywords to reject
+            exclude_labels = [
+                "ward", "post office", "police station", "patwari", "tehsil", "district", "pin code",
+                "details of part", "polling area", "sections in the part", "no. and name", "electoral roll",
+                "revision", "main town", "town or village", "town/village", "signature", "electoral registration"
+            ]
+            
+            candidates = []
+            for idx in indices_to_check:
+                if 0 <= idx < len(text_lines):
+                    cand = text_lines[idx].strip()
+                    # Strip leading colon
+                    cand_clean = re.sub(r'^\s*:\s*', '', cand).strip()
+                    if not cand_clean:
+                        continue
+                        
+                    # Skip section items like "1-Soppinahalli"
+                    if re.match(r'^\d+\s*[-–]\s*', cand_clean):
+                        continue
+                        
+                    # Skip if matches known labels
+                    cand_lower = cand_clean.lower()
+                    if any(label in cand_lower for label in exclude_labels):
+                        continue
+                        
+                    # Skip simple page numbers or counts
+                    if cand_clean.isdigit():
+                        continue
+                        
+                    dist = abs(idx - target_idx)
+                    candidates.append((dist, idx, cand_clean))
+                    
+            if candidates:
+                # Closer distance to label is better
+                candidates.sort()
+                booth_val = candidates[0][2]
+                logger.info(f"Extracted Town/Village (booth) from nearby candidate line (idx={candidates[0][1]}): {booth_val}")
+
+    if booth_val:
+        # Clean up common OCR merged colon typos, e.g. ": IDALLA" -> "HIDALLA"
+        if booth_val.upper().startswith("HIDALLA"):
+            booth_val = "IDALLA" + booth_val[7:]
+        metadata["booth"] = booth_val
+
+    # NOTE: section_no and village_area are intentionally NOT parsed from the cover page.
+    # They are read from each voter page header (Section No and Name X-...) starting page 3.
+    # This ensures the correct section is tracked per-page even when it changes mid-PDF.
+
     # Clean up spaces
     for key in metadata:
         metadata[key] = re.sub(r'\s+', ' ', metadata[key]).strip()
+
+    # Normalize booth name to exact standard village names (e.g. IDALLAKAVALU -> IDALLA KAVALU)
+    if "booth" in metadata and metadata["booth"]:
+        b_clean = re.sub(r'\s+', '', metadata["booth"]).upper()
+        if "IDALLA" in b_clean or "AIDALLA" in b_clean:
+            metadata["booth"] = "IDALLA KAVALU"
+        elif "SOPPINAHALLI" in b_clean:
+            metadata["booth"] = "SOPPINAHALLI"
         
     return metadata

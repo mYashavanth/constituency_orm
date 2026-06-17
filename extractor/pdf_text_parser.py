@@ -75,8 +75,8 @@ def extract_pdf_text_page(
     rect = page.rect
     w, h = rect.width, rect.height
     
-    # Header lines (top 8% of page height)
-    header_height_threshold = h * 0.08
+    # Header lines (top 10% of page height)
+    header_height_threshold = h * 0.10
     header_lines = [text for cx, cy, text in lines_with_coords if cy < header_height_threshold]
     
     sec_no, sec_name = parse_page_header_section(header_lines)
@@ -87,9 +87,22 @@ def extract_pdf_text_page(
 
     # Find name coordinates to build rows
     name_ys = []
+    name_exclude_keywords = [
+        "father", "fath", "fater", "tather", "ather",
+        "husband", "husb", "husoand", "nusoand", "hushand", "husban", "usband", "isband", "tusband",
+        "mother", "moth", "moter", "nother",
+        "wife", "wfe", "wiife",
+        "other", "othr", "relation",
+        "assembly", "constituency", "part", "section"
+    ]
     for cx, cy, text in lines_with_coords:
         text_lower = text.lower()
-        if "name" in text_lower and not any(k in text_lower for k in ["father", "husband", "mother", "wife", "relation"]):
+        has_name_prefix = any(n in text_lower for n in ["name", "nane", "nmae", "neme", "nama", "vame", "wame", "mane"])
+        is_relation = (
+            any(k in text_lower for k in name_exclude_keywords) or 
+            re.search(r'\b(?:gurus?|guardian|gurdian)\b', text_lower)
+        )
+        if has_name_prefix and not is_relation:
             name_ys.append(cy)
             
     name_ys = sorted(name_ys)
@@ -181,8 +194,8 @@ def extract_pdf_text_page(
             if is_valid_card(cell_texts):
                 valid_card_cells.append((c, r))
                 
-    # If the page has digital text but < 3 valid cards, it is a non-voter page (cover, summary, etc.)
-    if len(valid_card_cells) < 3:
+    # If the page has digital text but < 1 valid cards, it is a non-voter page (cover, summary, etc.)
+    if len(valid_card_cells) < 1:
         logger.info(f"Page {page_num}: Searchable non-voter page detected ({len(valid_card_cells)} valid cells). Skipping.")
         return [], False, current_section_no, current_village_area, expected_sl_no
 
