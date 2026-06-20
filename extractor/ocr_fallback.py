@@ -124,12 +124,15 @@ def extract_quadrant_crop(card_img: np.ndarray, quad: str) -> np.ndarray:
     Crops specific quadrants of the voter card to run targeted OCR:
     - 'top_left': Target Serial Number
     - 'top_right': Target EPIC Number
+    - 'bottom': Target Name, Relation, House Number, Age, and Gender
     """
     h, w = card_img.shape[:2]
     if quad == "top_left":
         return card_img[0:int(h*0.32), 0:int(w*0.40)]
     elif quad == "top_right":
         return card_img[0:int(h*0.32), int(w*0.40):w]
+    elif quad == "bottom":
+        return card_img[int(h*0.32):h, 0:w]
     return card_img
 
 def run_mac_vision_ocr(image_pil: Image.Image) -> Dict[str, Any]:
@@ -504,8 +507,20 @@ def extract_ocr_page(
                 epic_no = voter_fields.get("epic_no", "")
                 name = voter_fields.get("name", "")
                 age = voter_fields.get("age", "")
+                rel_name = voter_fields.get("relation_name", "")
+                rel_type = voter_fields.get("relation_type", "")
+                house_no = voter_fields.get("house_no", "")
+                gender = voter_fields.get("gender", "")
                 
-                # Check age validity
+                # Perform thorough validation check for all fields
+                relation_valid = bool(rel_name.strip())
+                relation_type_valid = rel_type in ["Father", "Husband", "Mother", "Wife"]
+                house_valid = house_no not in ["", "#"]
+                gender_valid = gender in ["Male", "Female", "Third Gender"]
+                epic_valid = bool(epic_no and 5 <= len(epic_no) <= 15)
+                name_valid = bool(name and any(c.isalpha() for c in name))
+                sl_valid = bool(sl_no.isdigit() and int(sl_no) > 0 and int(sl_no) == expected_sl_no)
+                
                 age_valid = True
                 if age and str(age).isdigit():
                     val = int(str(age))
@@ -514,8 +529,8 @@ def extract_ocr_page(
                 else:
                     age_valid = False
                 
-                # Bypasses fallback only if all critical fields are present and valid
-                if sl_no.isdigit() and int(sl_no) > 0 and epic_no and name and age_valid:
+                # Bypass card fallback ONLY if every single detail is present and valid
+                if sl_valid and epic_valid and name_valid and relation_type_valid and relation_valid and house_valid and age_valid and gender_valid:
                     use_fallback = False
                     
             if use_fallback:
@@ -528,14 +543,30 @@ def extract_ocr_page(
                     if fallback_lines:
                         fallback_fields = parse_card_text(fallback_lines)
                         for k, v in fallback_fields.items():
-                            if v or k not in voter_fields:
-                                voter_fields[k] = v
+                            if v and v != "#":
+                                curr_v = voter_fields.get(k, "")
+                                overwrite = False
+                                if k in ["sl_no", "epic_no"]:
+                                    overwrite = True
+                                elif not curr_v or str(curr_v).strip() == "#":
+                                    overwrite = True
+                                else:
+                                    if k == "age" and not str(curr_v).isdigit():
+                                        overwrite = True
+                                    elif k == "gender" and curr_v not in ["Male", "Female", "Third Gender"]:
+                                        overwrite = True
+                                    elif k == "relation_type" and curr_v not in ["Father", "Husband", "Mother", "Wife"]:
+                                        overwrite = True
+                                
+                                if overwrite:
+                                    voter_fields[k] = v
                 except Exception as ex:
                     logger.warning(f"Error in full card fallback at ({c},{r}): {ex}")
             
-            # Fallback for Serial Number
+            # --- Pass 3: Quadrant-Level Focused OCR (Read 2-3 Times) ---
+            # 1. Fallback for Serial Number
             sl_no = voter_fields.get("sl_no", "")
-            if not sl_no or not sl_no.isdigit():
+            if not sl_no or not sl_no.isdigit() or int(sl_no) != expected_sl_no:
                 try:
                     fallback_lines = run_quadrant_fallback_ocr(card_img, "top_left")
                     if fallback_lines:
@@ -543,7 +574,7 @@ def extract_ocr_page(
                         fallback_sl = parse_sl(fallback_lines)
                         if fallback_sl.isdigit():
                             voter_fields["sl_no"] = fallback_sl
-                            logger.info(f"Quadrant serial fallback found: {fallback_sl}")
+                            logger.info(f"  Quadrant serial fallback found: {fallback_sl}")
                 except Exception as ex:
                     logger.warning(f"Error in quadrant serial fallback at ({c},{r}): {ex}")
 
@@ -553,9 +584,9 @@ def extract_ocr_page(
                 voter_fields["sl_no"] = "0"
                 logger.debug(f"  Serial unreadable at ({c},{r}), marking as 0 for pipeline reconstruction.")
 
-            # Fallback for EPIC Number
+            # 2. Fallback for EPIC Number
             epic_no = voter_fields.get("epic_no", "")
-            if not epic_no:
+            if not epic_no or not (5 <= len(epic_no) <= 15):
                 try:
                     fallback_lines = run_quadrant_fallback_ocr(card_img, "top_right")
                     if fallback_lines:
@@ -563,9 +594,52 @@ def extract_ocr_page(
                         fallback_epic = parse_epic(fallback_lines)
                         if fallback_epic:
                             voter_fields["epic_no"] = fallback_epic
-                            logger.info(f"Quadrant EPIC fallback found: {fallback_epic}")
+                            logger.info(f"  Quadrant EPIC fallback found: {fallback_epic}")
                 except Exception as ex:
                     logger.warning(f"Error in quadrant EPIC fallback at ({c},{r}): {ex}")
+
+            # 3. Fallback for bottom details (Name, Relation Name, Relation Type, House No, Age, Gender)
+            name = voter_fields.get("name", "")
+            rel_name = voter_fields.get("relation_name", "")
+            rel_type = voter_fields.get("relation_type", "")
+            house_no = voter_fields.get("house_no", "")
+            age = voter_fields.get("age", "")
+            gender = voter_fields.get("gender", "")
+            
+            bottom_suspicious = (
+                not name or not any(char.isalpha() for char in name) or
+                not rel_name or
+                rel_type not in ["Father", "Husband", "Mother", "Wife"] or
+                house_no in ["", "#"] or
+                not age or not str(age).isdigit() or
+                gender not in ["Male", "Female", "Third Gender"]
+            )
+            
+            if bottom_suspicious:
+                try:
+                    fallback_lines = run_quadrant_fallback_ocr(card_img, "bottom")
+                    if fallback_lines:
+                        from extractor.voter_parser import parse_card_text as parse_card
+                        bottom_fields = parse_card(fallback_lines)
+                        for k in ["name", "relation_type", "relation_name", "house_no", "age", "gender"]:
+                            v = bottom_fields.get(k, "")
+                            if v and v != "#":
+                                curr_v = voter_fields.get(k, "")
+                                overwrite = False
+                                if not curr_v or str(curr_v).strip() == "#":
+                                    overwrite = True
+                                else:
+                                    if k == "age" and not str(curr_v).isdigit():
+                                        overwrite = True
+                                    elif k == "gender" and curr_v not in ["Male", "Female", "Third Gender"]:
+                                        overwrite = True
+                                    elif k == "relation_type" and curr_v not in ["Father", "Husband", "Mother", "Wife"]:
+                                        overwrite = True
+                                
+                                if overwrite:
+                                    voter_fields[k] = v
+                except Exception as ex:
+                    logger.warning(f"Error in bottom-half details fallback at ({c},{r}): {ex}")
             
             # Combine record with metadata
             full_record = {

@@ -244,21 +244,17 @@ def run_extraction_pipeline(
                             rec["village_area"] = current_village_area
 
                             # --- SERIAL RECONSTRUCTION ---
-                            # Enforce strict sequential continuity.
-                            # If the OCR serial number is missing, "0", or deviates from the expected
-                            # sequence (e.g. due to OCR typos like '77' -> '7'), correct it.
+                            # Only assign expected_sl_no if the parsed serial number is missing or 0.
+                            # We do NOT force sequential reordering of valid non-zero parsed serial numbers
+                            # because the serial number is fixed for each citizen, and any gaps should
+                            # remain visible to help trace missed cards rather than shifting/corrupting subsequent records.
                             sl_val = rec.get("sl_no", "")
                             try:
                                 sl_val_int = int(str(sl_val).strip())
                             except ValueError:
                                 sl_val_int = 0
 
-                            if sl_val_int == 0 or sl_val_int != expected_sl_no:
-                                if sl_val_int != 0:
-                                    logger.warning(
-                                        f"  [SL-CORRECT] Page {next_page_to_process}: "
-                                        f"sl_no was '{sl_val}', corrected to {expected_sl_no} to maintain sequence."
-                                    )
+                            if sl_val_int == 0:
                                 rec["sl_no"] = str(expected_sl_no)
                             # Validate and check serial sequence with correct expected_sl_no
                             warnings, sanitized_record = validate_voter_record(rec, expected_sl_no)
