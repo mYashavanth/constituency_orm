@@ -9,7 +9,15 @@ pip install -r requirements.txt
 
 :: Build standalone executable
 echo Running PyInstaller...
-pyinstaller --onefile --windowed --name="Karnataka_Electoral_Roll_Extractor" --add-data "electoral_roll_template.xlsx;." --collect-data customtkinter app.py
+pyinstaller --noconfirm --onefile --windowed ^
+            --name="Karnataka_Electoral_Roll_Extractor" ^
+            --add-data "electoral_roll_template.xlsx;." ^
+            --collect-data customtkinter ^
+            --collect-all paddleocr ^
+            --collect-all paddle ^
+            --collect-all pyclipper ^
+            --collect-all lmdb ^
+            app.py
 
 echo ====================================================================
 echo Build completed! Executable is located in the "dist" directory.

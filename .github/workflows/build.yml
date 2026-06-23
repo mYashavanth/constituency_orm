@@ -1,0 +1,82 @@
+name: Package Application
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86_64
+          - os: macos-latest
+            arch: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build macOS App
+        run: |
+          pyinstaller --noconfirm --onefile --windowed \
+                      --name="Karnataka_Electoral_Roll_Extractor_${{ matrix.arch }}" \
+                      --add-data "electoral_roll_template.xlsx:." \
+                      --collect-data customtkinter \
+                      --exclude-module paddle \
+                      --exclude-module paddleocr \
+                      --exclude-module paddlepaddle \
+                      app.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electoral-roll-extractor-mac-${{ matrix.arch }}
+          path: dist/Karnataka_Electoral_Roll_Extractor_${{ matrix.arch }}.app
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build Windows Executable
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+                      --name="Karnataka_Electoral_Roll_Extractor_Windows" `
+                      --add-data "electoral_roll_template.xlsx;." `
+                      --collect-data customtkinter `
+                      --collect-all paddleocr `
+                      --collect-all paddle `
+                      --collect-all pyclipper `
+                      --collect-all lmdb `
+                      app.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electoral-roll-extractor-windows
+          path: dist/Karnataka_Electoral_Roll_Extractor_Windows.exe

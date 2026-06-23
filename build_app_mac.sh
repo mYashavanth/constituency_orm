@@ -17,10 +17,13 @@ fi
 
 # Build macOS app bundle
 echo "Running PyInstaller..."
-pyinstaller --onefile --windowed \
+pyinstaller --noconfirm --onefile --windowed \
             --name="Karnataka_Electoral_Roll_Extractor" \
             --add-data "electoral_roll_template.xlsx:." \
             --collect-data customtkinter \
+            --exclude-module paddle \
+            --exclude-module paddleocr \
+            --exclude-module paddlepaddle \
             app.py
 
 echo "===================================================================="
