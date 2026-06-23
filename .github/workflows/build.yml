@@ -7,33 +7,26 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-macos:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: macos-13
-            suffix: x86_64
-          - os: macos-latest
-            suffix: arm64
+  build-macos-mchip:
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python (M-Chip)
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
 
-      - name: Build macOS App
+      - name: Build macOS M-Chip App
         run: |
-          pyinstaller --noconfirm --onefile --windowed \
-                      --name="Karnataka_Electoral_Roll_Extractor_${{ matrix.suffix }}" \
+          python3 -m PyInstaller --noconfirm --onefile --windowed \
+                      --name="Karnataka_Electoral_Roll_Extractor_Mac_M_Chip" \
                       --add-data "electoral_roll_template.xlsx:." \
                       --collect-data customtkinter \
                       --exclude-module paddle \
@@ -41,13 +34,50 @@ jobs:
                       --exclude-module paddlepaddle \
                       app.py
           cd dist
-          zip -r ../Karnataka_Electoral_Roll_Extractor_mac_${{ matrix.suffix }}.zip "Karnataka_Electoral_Roll_Extractor_${{ matrix.suffix }}.app"
+          zip -r ../Karnataka_Electoral_Roll_Extractor_Mac_M_Chip.zip "Karnataka_Electoral_Roll_Extractor_Mac_M_Chip.app"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: electoral-roll-extractor-mac-${{ matrix.suffix }}
-          path: Karnataka_Electoral_Roll_Extractor_mac_${{ matrix.suffix }}.zip
+          name: electoral-roll-extractor-mac-m-chip
+          path: Karnataka_Electoral_Roll_Extractor_Mac_M_Chip.zip
+
+  build-macos-intel:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install from Python.org to bypass libintl.8.dylib dynamic library crash on Rosetta
+      - name: Set up Python (Intel x64 via Python.org)
+        run: |
+          curl -O https://www.python.org/ftp/python/3.10.11/python-3.10.11-macos11.pkg
+          sudo installer -pkg python-3.10.11-macos11.pkg -target /
+          echo "/Library/Frameworks/Python.framework/Versions/3.10/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies (Intel x64)
+        run: |
+          arch -x86_64 python3 -m pip install --upgrade pip
+          arch -x86_64 pip3 install -r requirements.txt
+
+      - name: Build macOS Intel App
+        run: |
+          arch -x86_64 python3 -m PyInstaller --noconfirm --onefile --windowed \
+                      --name="Karnataka_Electoral_Roll_Extractor_Mac_Intel_Chip" \
+                      --add-data "electoral_roll_template.xlsx:." \
+                      --collect-data customtkinter \
+                      --exclude-module paddle \
+                      --exclude-module paddleocr \
+                      --exclude-module paddlepaddle \
+                      app.py
+          cd dist
+          zip -r ../Karnataka_Electoral_Roll_Extractor_Mac_Intel_Chip.zip "Karnataka_Electoral_Roll_Extractor_Mac_Intel_Chip.app"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electoral-roll-extractor-mac-intel-chip
+          path: Karnataka_Electoral_Roll_Extractor_Mac_Intel_Chip.zip
 
   build-windows:
     runs-on: windows-latest
