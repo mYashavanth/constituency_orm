@@ -135,7 +135,7 @@ def extract_quadrant_crop(card_img: np.ndarray, quad: str) -> np.ndarray:
         return card_img[int(h*0.32):h, 0:w]
     return card_img
 
-def run_mac_vision_ocr(image_pil: Image.Image) -> Dict[str, Any]:
+def run_mac_vision_ocr(image_pil: Image.Image, use_correction: bool = True) -> Dict[str, Any]:
     """
     Runs macOS native Vision OCR on a PIL Image.
     Returns a dictionary structured as:
@@ -170,7 +170,7 @@ def run_mac_vision_ocr(image_pil: Image.Image) -> Dict[str, Any]:
         handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
         request = Vision.VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(0) # Accurate (0)
-        request.setUsesLanguageCorrection_(True)
+        request.setUsesLanguageCorrection_(use_correction)
         
         success, error = handler.performRequests_error_([request], None)
         if not success:
@@ -245,13 +245,13 @@ def _normalize_ocr_result(ocr_res: Any) -> Dict[str, Any]:
         'rec_boxes': dt_polys
     }
 
-def run_ocr_on_image(image_pil: Image.Image) -> Dict[str, Any]:
+def run_ocr_on_image(image_pil: Image.Image, use_correction: bool = True) -> Dict[str, Any]:
     """
     Runs platform-specific OCR on a PIL Image.
     Returns normalized OCR dict with keys: rec_texts, dt_polys, rec_boxes.
     """
     if platform.system() == "Darwin":
-        return run_mac_vision_ocr(image_pil)
+        return run_mac_vision_ocr(image_pil, use_correction)
     else:
         cv_img = pil_to_cv2(image_pil)
         cv_img_3ch = ensure_3_channels(cv_img)
@@ -306,6 +306,36 @@ def run_quadrant_fallback_ocr(card_img: np.ndarray, quad: str) -> List[str]:
     except Exception as e:
         logger.error(f"OCR quadrant fallback error: {e}")
         return []
+
+# Common OCR misread keywords for the diagonal DELETED stamp
+_STAMP_KEYWORDS = ["delet", "deiet", "telet", "plet", "heret", "elet", "eiet", "leted", "deltd", "deted", "eled", "cel", "cancel"]
+
+def check_card_deleted(card_img: np.ndarray) -> bool:
+    """
+    Checks if a card has a "DELETED" stamp by running OCR at 0, -20, -25, -30, 20, 25, and 30 degrees.
+    Disables language correction to allow matching raw corrupted OCR characters (e.g. 'TELETED', 'A:4CELED').
+    """
+    try:
+        crop_bgr = ensure_3_channels(card_img)
+        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(crop_rgb)
+        
+        # Checking multiple angles to handle different stamp alignments
+        for angle in [0, -20, -25, -30, 20, 25, 30]:
+            if angle == 0:
+                rotated = pil_img
+            else:
+                rotated = pil_img.rotate(angle, expand=True, fillcolor=(255, 255, 255))
+                
+            res = run_ocr_on_image(rotated, use_correction=False)
+            texts = res.get('rec_texts', [])
+            for text in texts:
+                text_lower = text.lower()
+                if any(kw in text_lower for kw in _STAMP_KEYWORDS):
+                    return True
+    except Exception as e:
+        logger.warning(f"Error checking card deleted status: {e}")
+    return False
 
 def extract_ocr_page(
     pdf_path: str, 
@@ -492,6 +522,11 @@ def extract_ocr_page(
             y_end = int(row_ys[r] + (82 * dpi_scale))
             
             card_img = page_cv[max(0, y_start):min(h, y_end), max(0, x_start):min(w, x_end)]
+
+            # Crop a more generous region vertically to ensure diagonal "DELETED" stamps are not cut off
+            y_start_stamp = int(row_ys[r] - (55 * dpi_scale))
+            y_end_stamp = int(row_ys[r] + (95 * dpi_scale))
+            stamp_card_img = page_cv[max(0, y_start_stamp):min(h, y_end_stamp), max(0, x_start):min(w, x_end)]
             
             cell_texts = []
             if (c, r) in valid_card_cells:
@@ -641,6 +676,27 @@ def extract_ocr_page(
                 except Exception as ex:
                     logger.warning(f"Error in bottom-half details fallback at ({c},{r}): {ex}")
             
+            # Pre-validate to check if card has any issues or warning signs
+            temp_record = {
+                "ac_no": metadata.get("ac_no", ""),
+                "ac_name": metadata.get("ac_name", ""),
+                "booth_no": metadata.get("booth_no", ""),
+                "booth_name": metadata.get("booth_name", ""),
+                "booth": metadata.get("booth", ""),
+                "section_no": current_section_no,
+                "village_area": current_village_area,
+                **voter_fields
+            }
+            temp_warnings, _ = validate_voter_record(temp_record, expected_sl_no)
+
+            # Check for graphical "DELETED" stamp overlay on OCR fallback page
+            is_deleted = voter_fields.get("is_deleted", False)
+            if not is_deleted:
+                # Only perform multi-rotation stamp check if the card has warnings or low line count
+                if len(temp_warnings) > 0 or len(cell_texts) < 7:
+                    is_deleted = check_card_deleted(stamp_card_img)
+            voter_fields["is_deleted"] = is_deleted
+
             # Combine record with metadata
             full_record = {
                 "ac_no": metadata.get("ac_no", ""),

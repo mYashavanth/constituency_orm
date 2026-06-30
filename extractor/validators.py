@@ -69,6 +69,9 @@ def validate_voter_record(record: Dict[str, Any], expected_sl_no: int = None) ->
     if not name:
         warnings.append("Voter name is missing.")
 
+    if cleaned.get("is_deleted"):
+        warnings.append("Voter is marked as DELETED on the roll.")
+
     # 4. Standardize Relation Type
     rel_type = str(cleaned.get("relation_type", "")).strip().capitalize()
     if not rel_type:
@@ -82,6 +85,8 @@ def validate_voter_record(record: Dict[str, Any], expected_sl_no: int = None) ->
     cleaned["relation_name"] = rel_name
     if not rel_name:
         warnings.append("Relative name is missing.")
+    elif name and rel_name and name.lower() == rel_name.lower():
+        warnings.append("Voter name and relation name are identical.")
 
     # 6. Validate House Number
     house_no = str(cleaned.get("house_no", "")).strip()

@@ -22,6 +22,18 @@ _GENDER_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
+# Matches "Name" and common OCR typos like lame, jame, ame, mane, nane, nmae, etc.
+_NAME_LABEL_RE = re.compile(
+    r'\b(?:[nljawvmrtdhgs]?ame|[nljawvmrtdhgs]?ane|nmae|neme|nama)\b',
+    re.IGNORECASE
+)
+
+# Matches "DELETED" stamp and its common OCR misread variants
+DELETED_RE = re.compile(
+    r'\b(?:delet|deiet|de-let|del-et|d[.\s]*e[.\s]*l[.\s]*e[.\s]*t[.\s]*e[.\s]*d)\w*\b',
+    re.IGNORECASE
+)
+
 # Field keyword list for sl_no parsing exclusion
 _SL_SKIP_KEYWORDS = [
     "name", "father", "husband", "mother", "wife", "house", "number",
@@ -179,12 +191,12 @@ def parse_name(text_lines: List[str]) -> str:
     """
     for line in text_lines:
         lower_line = line.lower()
-        if any(n in lower_line for n in ["name", "nane", "nmae", "neme", "nama", "vame", "wame", "mane"]) and not is_relation_line(line):
+        if _NAME_LABEL_RE.search(lower_line) and not is_relation_line(line):
             parts = line.split(":", 1)
             name_val = parts[1].strip() if len(parts) > 1 else line
-            # Clean up the prefix "Name", "Nane", etc. if there is no colon
+            # Clean up the prefix (Name, Lame, Jame, Ame, etc.)
             if len(parts) <= 1:
-                name_val = re.sub(r'^(?:name|nane|nmae|neme|nama|vame|wame|mane)\s*[:.\-–\s]*', '', name_val, flags=re.IGNORECASE).strip()
+                name_val = _NAME_LABEL_RE.sub('', name_val).strip()
             name_val = re.sub(r'^[\s:.-]+', '', name_val).strip()
 
             # Reject photo noise
@@ -201,11 +213,10 @@ def parse_name(text_lines: List[str]) -> str:
         if not is_relation_line(line):
             lower_line = line.lower()
             skip_keywords = [
-                "name", "nane", "nmae", "neme", "nama", "vame", "wame", "mane",
                 "house", "number", "no.", "age", "gender", "sex", "deleted", "section", "part",
                 "assembly", "constituency"
             ]
-            if not any(k in lower_line for k in skip_keywords):
+            if not _NAME_LABEL_RE.search(lower_line) and not any(k in lower_line for k in skip_keywords):
                 cleaned_line = line.strip()
                 if (len(cleaned_line) > 3
                         and not re.match(r'^[A-Z]{3}\d{7}$', cleaned_line, re.IGNORECASE)
@@ -232,7 +243,7 @@ def parse_relation(text_lines: List[str]) -> Tuple[str, str]:
             left_clean = left.strip().lower()
 
             # Skip if this is the voter's own name line
-            if left_clean in ["name", "nane", "nmae", "neme", "nama", "vame", "wame", "mane"]:
+            if _NAME_LABEL_RE.match(left_clean):
                 continue
 
             # Skip if this is the house number line
@@ -556,11 +567,11 @@ def parse_age_gender(text_lines: List[str]) -> Tuple[str, str]:
 
 
 
-def parse_card_text(text_lines: List[str]) -> Dict[str, str]:
+def parse_card_text(text_lines: List[str]) -> Dict[str, Any]:
     """
     Parses a single voter card text lines into structured fields.
     """
-    is_deleted = any("delete" in line.lower() for line in text_lines)
+    is_deleted = any(DELETED_RE.search(line) for line in text_lines)
 
     sl_no = parse_sl_no(text_lines)
     epic_no = parse_epic_no(text_lines)
@@ -568,9 +579,6 @@ def parse_card_text(text_lines: List[str]) -> Dict[str, str]:
     rel_type, rel_name = parse_relation(text_lines)
     house_no = parse_house_no(text_lines, sl_no, epic_no)
     age, gender = parse_age_gender(text_lines)
-
-    if is_deleted and name:
-        name = f"[DELETED] {name}"
 
     return {
         "sl_no": sl_no,
@@ -580,5 +588,6 @@ def parse_card_text(text_lines: List[str]) -> Dict[str, str]:
         "relation_name": rel_name,
         "house_no": house_no,
         "age": age,
-        "gender": gender
+        "gender": gender,
+        "is_deleted": is_deleted
     }

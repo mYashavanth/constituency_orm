@@ -1,11 +1,49 @@
 import fitz
 import numpy as np
 import re
+import io
+from PIL import Image
 from typing import List, Dict, Tuple, Any, Optional
 from extractor.logger import logger
-from extractor.voter_parser import parse_card_text
+from extractor.voter_parser import parse_card_text, DELETED_RE
 from extractor.validators import validate_voter_record, is_record_creatable
 from extractor.section_parser import parse_page_header_section
+from extractor.ocr_fallback import run_ocr_on_image, check_card_deleted, pil_to_cv2
+
+def detect_page_deleted_stamps(page: fitz.Page) -> List[fitz.Rect]:
+    """
+    Renders the entire page, runs OCR, and returns a list of bounding boxes
+    where the word "DELETED" (or common OCR typos of it) was found.
+    Coordinates are scaled back to standard PDF points (72 DPI).
+    """
+    deleted_rects = []
+    try:
+        # Render page at 150 DPI
+        zoom = 150.0 / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_data = pix.tobytes("png")
+        
+        img = Image.open(io.BytesIO(img_data))
+        ocr_res = run_ocr_on_image(img)
+        
+        rec_texts = ocr_res.get('rec_texts', [])
+        dt_polys = ocr_res.get('dt_polys', [])
+        
+        for i, text in enumerate(rec_texts):
+            if DELETED_RE.search(text):
+                poly = dt_polys[i]
+                xs = [pt[0] for pt in poly]
+                ys = [pt[1] for pt in poly]
+                # Scale back to standard 72 DPI
+                x0 = min(xs) / zoom
+                y0 = min(ys) / zoom
+                x1 = max(xs) / zoom
+                y1 = max(ys) / zoom
+                deleted_rects.append(fitz.Rect(x0, y0, x1, y1))
+    except Exception as e:
+        logger.warning(f"Failed to detect deleted stamps on page: {e}")
+    return deleted_rects
 
 def is_valid_card(cell_lines: List[str]) -> bool:
     """
@@ -199,6 +237,14 @@ def extract_pdf_text_page(
         logger.info(f"Page {page_num}: Searchable non-voter page detected ({len(valid_card_cells)} valid cells). Skipping.")
         return [], False, current_section_no, current_village_area, expected_sl_no
 
+    # Render page at 150 DPI for visual deleted stamp check
+    zoom = 150.0 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img_data = pix.tobytes("png")
+    page_pil = Image.open(io.BytesIO(img_data))
+    page_cv = pil_to_cv2(page_pil)
+
     # Parse cards
     page_records = []
     for r in range(10):
@@ -210,6 +256,34 @@ def extract_pdf_text_page(
             cell_texts = [line[2] for line in cell_lines]
             
             voter_fields = parse_card_text(cell_texts)
+            
+            # Pre-validate to check if card has any issues or warning signs
+            temp_record = {
+                "ac_no": metadata.get("ac_no", ""),
+                "ac_name": metadata.get("ac_name", ""),
+                "booth_no": metadata.get("booth_no", ""),
+                "booth_name": metadata.get("booth_name", ""),
+                "booth": metadata.get("booth", ""),
+                "section_no": current_section_no,
+                "village_area": current_village_area,
+                **voter_fields
+            }
+            temp_warnings, _ = validate_voter_record(temp_record, expected_sl_no)
+
+            # Check for graphical "DELETED" stamp overlay on searchable PDF page
+            is_deleted = voter_fields.get("is_deleted", False)
+            if not is_deleted:
+                # Only perform multi-rotation stamp check if the card has warnings or low line count
+                if len(temp_warnings) > 0 or len(cell_texts) < 7:
+                    # Crop a more generous region vertically to ensure diagonal "DELETED" stamps are not cut off
+                    x_start = int(c * col_width * zoom)
+                    x_end = int((c + 1) * col_width * zoom)
+                    y_start_stamp = int((row_ys[r] - 55) * zoom)
+                    y_end_stamp = int((row_ys[r] + 95) * zoom)
+                    
+                    stamp_card_img = page_cv[max(0, y_start_stamp):min(page_cv.shape[0], y_end_stamp), max(0, x_start):min(page_cv.shape[1], x_end)]
+                    is_deleted = check_card_deleted(stamp_card_img)
+            voter_fields["is_deleted"] = is_deleted
             
             # Combine record with metadata
             full_record = {
