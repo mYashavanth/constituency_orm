@@ -85,8 +85,11 @@ class AppUI(ctk.CTk):
         self.entry_temp = ctk.CTkEntry(files_frame, placeholder_text="Select Excel template structure (.xlsx)...")
         self.entry_temp.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
         
-        # Check if default template is present in workspace root
-        default_template = Path(__file__).resolve().parent.parent / "electoral_roll_template.xlsx"
+        # Check if default template is present in workspace root or bundled in PyInstaller
+        if hasattr(sys, '_MEIPASS'):
+            default_template = Path(sys._MEIPASS) / "electoral_roll_template.xlsx"
+        else:
+            default_template = Path(__file__).resolve().parent.parent / "electoral_roll_template.xlsx"
         if default_template.exists():
             self.entry_temp.insert(0, str(default_template))
             

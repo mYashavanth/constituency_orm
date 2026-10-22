@@ -17,14 +17,7 @@ fi
 
 # Build macOS app bundle
 echo "Running PyInstaller..."
-pyinstaller --noconfirm --onefile --windowed \
-            --name="Karnataka_Electoral_Roll_Extractor" \
-            --add-data "electoral_roll_template.xlsx:." \
-            --collect-data customtkinter \
-            --exclude-module paddle \
-            --exclude-module paddleocr \
-            --exclude-module paddlepaddle \
-            app.py
+pyinstaller --noconfirm Karnataka_Electoral_Roll_Extractor.spec
 
 echo "===================================================================="
 echo "Build completed! Standalone App bundle is located in: dist/Karnataka_Electoral_Roll_Extractor.app"
